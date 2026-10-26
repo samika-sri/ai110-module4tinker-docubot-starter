@@ -9,6 +9,39 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Common words that carry little meaning and would otherwise dominate scores
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does",
+    "for", "from", "how", "i", "in", "is", "it", "of", "on", "or", "that",
+    "the", "there", "these", "this", "to", "what", "when", "where", "which",
+    "who", "with", "any",
+}
+
+# Guardrail: a snippet must score at least this much to count as evidence.
+# If no snippet reaches it, DocuBot refuses instead of guessing.
+MIN_SCORE = 2
+
+
+def tokenize(text):
+    """
+    Lowercases text and splits it into words, dropping punctuation
+    and stopwords. Underscores are kept so names like auth_utils stay whole.
+    """
+    words = re.findall(r"[a-z0-9_]+", text.lower())
+    return [w for w in words if w not in STOPWORDS]
+
+
+def split_into_sections(filename, text):
+    """
+    Splits a markdown document into one snippet per heading. Each snippet
+    starts at a line beginning with '#' and runs until the next heading.
+    Returns a list of (filename, section_text) tuples.
+    """
+    sections = re.split(r"\n(?=#)", text)
+    return [(filename, section.strip()) for section in sections if section.strip()]
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +55,13 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Split documents into smaller sections so retrieval returns focused snippets
+        self.sections = []  # List of (filename, section_text)
+        for filename, text in self.documents:
+            self.sections.extend(split_into_sections(filename, text))
+
+        # Build a retrieval index over sections (implemented in Phase 1)
+        self.index = self.build_index(self.sections)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -51,20 +89,20 @@ class DocuBot:
     def build_index(self, documents):
         """
         TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to the sections
+        they appear in. Sections are identified by their position in the
+        list passed in (self.sections).
 
         Example structure:
         {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
+            "token": [3, 4, 15],
+            "database": [22, 23]
         }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for position, (_, text) in enumerate(documents):
+            for word in set(tokenize(text)):
+                index.setdefault(word, []).append(position)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +119,11 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        text_words = tokenize(text)
+        score = 0
+        for word in set(tokenize(query)):
+            score += text_words.count(word)
+        return score
 
     def retrieve(self, query, top_k=3):
         """
@@ -90,9 +131,23 @@ class DocuBot:
         Use the index and scoring function to select top_k relevant document snippets.
 
         Return a list of (filename, text) sorted by score descending.
+        Snippets scoring below MIN_SCORE are dropped, so an empty list means
+        the docs hold no meaningful evidence and the caller should refuse.
         """
-        results = []
-        # TODO: implement retrieval logic
+        # Use the index to find sections sharing at least one query word
+        candidates = set()
+        for word in tokenize(query):
+            candidates.update(self.index.get(word, []))
+
+        scored = []
+        for position in sorted(candidates):
+            filename, text = self.sections[position]
+            score = self.score_document(query, text)
+            if score >= MIN_SCORE:
+                scored.append((score, filename, text))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        results = [(filename, text) for _, filename, text in scored]
         return results[:top_k]
 
     # -----------------------------------------------------------
